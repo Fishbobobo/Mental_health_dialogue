@@ -25,6 +25,123 @@ db_config = {
 MAXTURN = 30
 
 
+def _extract_scalar(row, key=None, default=0):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        if key is not None:
+            return row.get(key, default)
+        return next(iter(row.values()), default)
+    if isinstance(row, (list, tuple)):
+        return row[0] if row else default
+    return row
+
+
+def _fetch_count(cursor, sql, params):
+    cursor.execute(sql, params)
+    return int(_extract_scalar(cursor.fetchone(), default=0) or 0)
+
+
+def ensure_periodic_feature_schema(cursor):
+    tables = {
+        "PHQ_9_detail": """
+            CREATE TABLE IF NOT EXISTS `PHQ_9_detail` (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                d1 TEXT DEFAULT NULL,
+                d2 TEXT DEFAULT NULL,
+                d3 TEXT DEFAULT NULL,
+                d4 TEXT DEFAULT NULL,
+                d5 TEXT DEFAULT NULL,
+                d6 TEXT DEFAULT NULL,
+                d7 TEXT DEFAULT NULL,
+                d8 TEXT DEFAULT NULL,
+                d9 TEXT DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+        """,
+        "GAD_7_detail": """
+            CREATE TABLE IF NOT EXISTS `GAD_7_detail` (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                d1 TEXT DEFAULT NULL,
+                d2 TEXT DEFAULT NULL,
+                d3 TEXT DEFAULT NULL,
+                d4 TEXT DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+        """,
+        "summary_phased": """
+            CREATE TABLE IF NOT EXISTS summary_phased (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                summary MEDIUMTEXT DEFAULT NULL,
+                keywords MEDIUMTEXT DEFAULT NULL,
+                main_problems MEDIUMTEXT DEFAULT NULL,
+                suggestions MEDIUMTEXT DEFAULT NULL,
+                text_evaluation MEDIUMTEXT DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+        """,
+        "update_signals": """
+            CREATE TABLE IF NOT EXISTS update_signals (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                evaluate TINYINT DEFAULT 0,
+                summary TINYINT DEFAULT 0,
+                last_modified DATETIME DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+        """,
+    }
+
+    for create_sql in tables.values():
+        cursor.execute(create_sql)
+
+    column_exists = _fetch_count(
+        cursor,
+        """
+        SELECT COUNT(*)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+        """,
+        (db_config["database"], "instant_info", "summary"),
+    )
+    if not column_exists:
+        cursor.execute(
+            """
+            ALTER TABLE instant_info
+            ADD COLUMN summary MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL
+            """
+        )
+
+    cursor.connection.commit()
+
+
+def ensure_periodic_feature_rows(cursor, user_id):
+    ensure_periodic_feature_schema(cursor)
+    user_exists = _fetch_count(
+        cursor,
+        "SELECT COUNT(*) FROM student_info WHERE id = %s",
+        (user_id,),
+    )
+    if not user_exists:
+        return
+
+    row_specs = (
+        ("PHQ_9_detail", new_phq_detail),
+        ("GAD_7_detail", new_gad_detail),
+        ("summary_phased", new_summary_phased),
+        ("update_signals", new_update_signals),
+    )
+    for table_name, create_row in row_specs:
+        exists = _fetch_count(
+            cursor,
+            f"SELECT COUNT(*) FROM `{table_name}` WHERE id = %s",
+            (user_id,),
+        )
+        if not exists:
+            create_row(cursor, user_id)
+
+    cursor.connection.commit()
+
+
 # 对dialogue_history进行信息过滤，获取简洁适配算法的聊天记录
 def filter_info(dialogue_history):
     # 过滤和重构数据
@@ -615,7 +732,10 @@ def new_student_info(cursor, id, password):
 
 def new_instant_info(cursor, id):
     try:
-        insert = "INSERT INTO instant_info (id, dialogue, turn) VALUES (%s, '[]', %s)"
+        insert = (
+            "INSERT INTO instant_info (id, dialogue, turn, summary) "
+            "VALUES (%s, '[]', %s, NULL)"
+        )
         cursor.execute(insert, (id, MAXTURN))
     except Exception as e:
         print(f"插入 instant_info 失败：{e}")
@@ -658,12 +778,62 @@ def new_result(cursor, id):
         raise
 
 
+def new_gad_detail(cursor, id):
+    try:
+        insert = (
+            "INSERT INTO `GAD_7_detail` (id, d1, d2, d3, d4) "
+            "VALUES (%s, NULL, NULL, NULL, NULL)"
+        )
+        cursor.execute(insert, (id,))
+    except Exception as e:
+        print(f"插入 GAD_7_detail 失败：{e}")
+        raise
+
+
+def new_phq_detail(cursor, id):
+    try:
+        insert = (
+            "INSERT INTO `PHQ_9_detail` (id, d1, d2, d3, d4, d5, d6, d7, d8, d9) "
+            "VALUES (%s, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+        )
+        cursor.execute(insert, (id,))
+    except Exception as e:
+        print(f"插入 PHQ_9_detail 失败：{e}")
+        raise
+
+
+def new_summary_phased(cursor, id):
+    try:
+        insert = (
+            "INSERT INTO summary_phased "
+            "(id, summary, keywords, main_problems, suggestions, text_evaluation) "
+            "VALUES (%s, NULL, NULL, NULL, NULL, NULL)"
+        )
+        cursor.execute(insert, (id,))
+    except Exception as e:
+        print(f"插入 summary_phased 失败：{e}")
+        raise
+
+
+def new_update_signals(cursor, id):
+    try:
+        insert = (
+            "INSERT INTO update_signals (id, evaluate, summary, last_modified) "
+            "VALUES (%s, 0, 0, NULL)"
+        )
+        cursor.execute(insert, (id,))
+    except Exception as e:
+        print(f"插入 update_signals 失败：{e}")
+        raise
+
+
 # 根据身份证号和密码创建一条记录
 def create_a_record(cursor, id, password):
     try:
         # 每个线程独立获取一个连接
         conn = Config.PYMYSQL_POOL.connection()
         cursor1 = conn.cursor()
+        ensure_periodic_feature_schema(cursor1)
         conn.begin()  # 开始事务
         new_student_info(cursor1, id, password)
         new_instant_info(cursor1, id)
@@ -671,6 +841,10 @@ def create_a_record(cursor, id, password):
         new_gad(cursor1, id)
         new_topic(cursor1, id)
         new_result(cursor1, id)
+        new_gad_detail(cursor1, id)
+        new_phq_detail(cursor1, id)
+        new_summary_phased(cursor1, id)
+        new_update_signals(cursor1, id)
         # 提交事务
         conn.commit()
         print("所有记录成功插入！")
@@ -747,6 +921,165 @@ def get_timestamp(cursor, id):
     return result["timestamp"]
 
 
+def query_phq9_result(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    cursor.execute("SELECT * FROM `PHQ-9` WHERE id = %s", (user_name,))
+    score_row = cursor.fetchone()
+    cursor.execute("SELECT * FROM `PHQ_9_detail` WHERE id = %s", (user_name,))
+    detail_row = cursor.fetchone()
+
+    if not score_row:
+        return 0, []
+
+    scores = [score_row.get(f"q{i}") for i in range(1, 10)]
+    symptoms = [detail_row.get(f"d{i}") if detail_row else None for i in range(1, 10)]
+    total_score = sum(score for score in scores if score is not None and score != -1)
+    details = [{"score": scores[i], "symptom": symptoms[i]} for i in range(9)]
+    return total_score, details
+
+
+def query_gad7_result(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    cursor.execute("SELECT * FROM `GAD-7` WHERE id = %s", (user_name,))
+    score_row = cursor.fetchone()
+    cursor.execute("SELECT * FROM `GAD_7_detail` WHERE id = %s", (user_name,))
+    detail_row = cursor.fetchone()
+
+    if not score_row:
+        return 0, []
+
+    scores = [score_row.get(f"q{i}") for i in range(1, 5)]
+    symptoms = [detail_row.get(f"d{i}") if detail_row else None for i in range(1, 5)]
+    total_score = sum(score for score in scores if score is not None and score != -1)
+    details = [{"score": scores[i], "symptom": symptoms[i]} for i in range(4)]
+    return total_score, details
+
+
+def update_text_evaluation_to_db(cursor, user_id, text_evaluation):
+    ensure_periodic_feature_schema(cursor)
+    sql = "UPDATE summary_phased SET text_evaluation = %s WHERE id = %s"
+    cursor.execute(sql, (text_evaluation, user_id))
+
+
+def get_all_update_signals(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    sql = "SELECT * FROM update_signals WHERE id = %s"
+    cursor.execute(sql, (user_name,))
+    result = cursor.fetchone()
+    return dict(result) if result else {}
+
+
+def update_signals_15(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exists = _fetch_count(
+        cursor,
+        "SELECT COUNT(*) FROM update_signals WHERE id = %s",
+        (user_name,),
+    )
+    if exists:
+        cursor.execute(
+            """
+            UPDATE update_signals
+            SET evaluate = 1, last_modified = %s
+            WHERE id = %s
+            """,
+            (current_time, user_name),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO update_signals (id, evaluate, summary, last_modified)
+            VALUES (%s, 1, 0, %s)
+            """,
+            (user_name, current_time),
+        )
+
+
+def update_signals_20(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exists = _fetch_count(
+        cursor,
+        "SELECT COUNT(*) FROM update_signals WHERE id = %s",
+        (user_name,),
+    )
+    if exists:
+        cursor.execute(
+            """
+            UPDATE update_signals
+            SET summary = 1, last_modified = %s
+            WHERE id = %s
+            """,
+            (current_time, user_name),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO update_signals (id, evaluate, summary, last_modified)
+            VALUES (%s, 0, 1, %s)
+            """,
+            (user_name, current_time),
+        )
+
+
+def clear_evaluate_signal(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    cursor.execute(
+        """
+        UPDATE update_signals
+        SET evaluate = %s
+        WHERE id = %s
+        """,
+        (0, user_name),
+    )
+
+
+def clear_summary_signal(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    cursor.execute(
+        """
+        UPDATE update_signals
+        SET summary = %s
+        WHERE id = %s
+        """,
+        (0, user_name),
+    )
+
+
+def get_last_modified_time(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    cursor.execute("SELECT last_modified FROM update_signals WHERE id = %s", (user_name,))
+    result = cursor.fetchone()
+    if isinstance(result, dict):
+        return result.get("last_modified")
+    return _extract_scalar(result, default=None)
+
+
+def get_summary_phased(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    cursor.execute("SELECT * FROM summary_phased WHERE id = %s", (user_name,))
+    result = cursor.fetchone()
+    return dict(result) if result else {}
+
+
+def update_summary_phased_all(
+    cursor, user_id, summary_text, keyword_list, problem_list, suggestion_text
+):
+    ensure_periodic_feature_schema(cursor)
+    sql = """
+        UPDATE summary_phased
+        SET summary = %s,
+            keywords = %s,
+            main_problems = %s,
+            suggestions = %s
+        WHERE id = %s
+    """
+    cursor.execute(
+        sql, (summary_text, keyword_list, problem_list, suggestion_text, user_id)
+    )
+
+
 def main():
     try:
         # 连接
@@ -794,6 +1127,7 @@ def main():
                 dialogue MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,
                 turn INT DEFAULT NULL,
                 filter_dialogue MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,
+                summary MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,
                 PRIMARY KEY (id) USING BTREE
             ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
             """,
@@ -851,6 +1185,51 @@ def main():
                 timestamp BIGINT DEFAULT NULL,
                 PRIMARY KEY (id) USING BTREE
             ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_general_ci ROW_FORMAT = Dynamic;
+            """,
+            "PHQ_9_detail": """
+            CREATE TABLE IF NOT EXISTS `PHQ_9_detail` (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                d1 TEXT DEFAULT NULL,
+                d2 TEXT DEFAULT NULL,
+                d3 TEXT DEFAULT NULL,
+                d4 TEXT DEFAULT NULL,
+                d5 TEXT DEFAULT NULL,
+                d6 TEXT DEFAULT NULL,
+                d7 TEXT DEFAULT NULL,
+                d8 TEXT DEFAULT NULL,
+                d9 TEXT DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+            """,
+            "GAD_7_detail": """
+            CREATE TABLE IF NOT EXISTS `GAD_7_detail` (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                d1 TEXT DEFAULT NULL,
+                d2 TEXT DEFAULT NULL,
+                d3 TEXT DEFAULT NULL,
+                d4 TEXT DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+            """,
+            "summary_phased": """
+            CREATE TABLE IF NOT EXISTS summary_phased (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                summary MEDIUMTEXT DEFAULT NULL,
+                keywords MEDIUMTEXT DEFAULT NULL,
+                main_problems MEDIUMTEXT DEFAULT NULL,
+                suggestions MEDIUMTEXT DEFAULT NULL,
+                text_evaluation MEDIUMTEXT DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
+            """,
+            "update_signals": """
+            CREATE TABLE IF NOT EXISTS update_signals (
+                id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+                evaluate TINYINT DEFAULT 0,
+                summary TINYINT DEFAULT 0,
+                last_modified DATETIME DEFAULT NULL,
+                PRIMARY KEY (id) USING BTREE
+            ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
             """,
         }
 

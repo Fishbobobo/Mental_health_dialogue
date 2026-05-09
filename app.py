@@ -17,15 +17,24 @@ import time
 from datetime import datetime, timedelta
 import json
 import random
+import threading
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkdysmsapi.request.v20170525.SendSmsRequest import SendSmsRequest
 
 # 算法部分的导入
 from agent import run_agent_turn
+from process_every_Nturns.extract_symptoms_from_dialogue_15 import extract_symptoms_from_dialogue
+from process_every_Nturns.summary_phased_20 import process_dialogue_and_update_db
+from symptom_judge import symptom_judge
+from utils.two_scales import get_phq9_level, get_gad7_level
 
 from sql_tool import select_user, update_info, get_history_chat, update_login_time, update_turn, get_turn, \
     id_exist, create_a_record, reset_password, \
-    get_code, update_code, get_timestamp, new_code, id_exist_in_code
+    get_code, update_code, get_timestamp, new_code, id_exist_in_code, \
+    get_history_summary, get_api, get_all_update_signals, clear_evaluate_signal, \
+    clear_summary_signal, get_last_modified_time, get_summary_phased, query_phq9_result, \
+    query_gad7_result, update_signals_15, update_signals_20, ensure_periodic_feature_schema, \
+    ensure_periodic_feature_rows
 
 from error import DialogueError, SpeechError
 from content_check import TextContentCheck
@@ -63,6 +72,112 @@ def random_openingline():
 def dialogue_reply(cursor, user_name):
     reply = run_agent_turn(cursor, user_name)
     return reply
+
+
+def _normalize_dialogue_history(dialogue_history):
+    normalized = []
+    for item in dialogue_history:
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant"} and content:
+            normalized.append({role: content})
+    return normalized
+
+
+def _count_user_turns(dialogue_history):
+    return sum(1 for item in dialogue_history if item.get("role") == "user")
+
+
+def async_symptom_judge_process(user_name, dialogue_history, summary_before, api_key):
+    try:
+        symptom_list = extract_symptoms_from_dialogue(
+            dialogue_history, summary_before, api_key
+        )
+        new_conn = Config.PYMYSQL_POOL.connection()
+        new_cursor = new_conn.cursor()
+        try:
+            ensure_periodic_feature_schema(new_cursor)
+            for symptom_index, symptom_detail in symptom_list:
+                judge = symptom_judge(symptom_index, dialogue_history, api_key)
+                if judge is None or judge < 0:
+                    continue
+                if 1 <= symptom_index <= 9:
+                    new_cursor.execute(
+                        f"UPDATE `PHQ-9` SET q{symptom_index} = %s WHERE id = %s",
+                        (judge, user_name),
+                    )
+                    new_cursor.execute(
+                        f"UPDATE `PHQ_9_detail` SET d{symptom_index} = %s WHERE id = %s",
+                        (symptom_detail, user_name),
+                    )
+                elif 10 <= symptom_index <= 13:
+                    gad_index = symptom_index - 9
+                    new_cursor.execute(
+                        f"UPDATE `GAD-7` SET q{gad_index} = %s WHERE id = %s",
+                        (judge, user_name),
+                    )
+                    new_cursor.execute(
+                        f"UPDATE `GAD_7_detail` SET d{gad_index} = %s WHERE id = %s",
+                        (symptom_detail, user_name),
+                    )
+            update_signals_15(new_cursor, user_name)
+            new_conn.commit()
+        finally:
+            new_cursor.close()
+            new_conn.close()
+    except Exception as e:
+        print(f"异步症状评估失败: {e}")
+
+
+def async_summary_update_process(user_name, dialogue_history, summary_before, api_key):
+    try:
+        new_conn = Config.PYMYSQL_POOL.connection()
+        new_cursor = new_conn.cursor()
+        try:
+            ensure_periodic_feature_schema(new_cursor)
+            process_dialogue_and_update_db(
+                dialogue_history=dialogue_history,
+                summary_before=summary_before,
+                api_key=api_key,
+                user_id=user_name,
+                cursor=new_cursor,
+            )
+            update_signals_20(new_cursor, user_name)
+            new_conn.commit()
+        finally:
+            new_cursor.close()
+            new_conn.close()
+    except Exception as e:
+        print(f"异步阶段总结失败: {e}")
+
+
+def trigger_periodic_background_tasks(cursor, user_name):
+    ensure_periodic_feature_schema(cursor)
+    dialogue_history = get_history_chat(cursor, user_name)
+    user_turn_count = _count_user_turns(dialogue_history)
+    if user_turn_count <= 0:
+        return
+
+    api_key = get_api(cursor, user_name)
+    if not api_key:
+        return
+
+    normalized_dialogue = _normalize_dialogue_history(dialogue_history[-20:])
+    summary_before = get_history_summary(cursor, user_name) or ""
+
+    if user_turn_count % 5 == 0:
+        threading.Thread(
+            target=async_symptom_judge_process,
+            args=(user_name, normalized_dialogue, summary_before, api_key),
+            daemon=True,
+        ).start()
+
+    if user_turn_count % 20 == 0:
+        threading.Thread(
+            target=async_summary_update_process,
+            args=(user_name, normalized_dialogue, summary_before, api_key),
+            daemon=True,
+        ).start()
 
 
 # 接口1------登录检测
@@ -104,6 +219,7 @@ def login():
         # 从连接池获取连接
         conn = Config.PYMYSQL_POOL.connection()
         cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
         # 查询数据库判断用户及密码是否正确
         if select_user(cursor, user_name, password):
             # 获取当前时间
@@ -232,6 +348,7 @@ def voicechat():
 
         conn = Config.PYMYSQL_POOL.connection()
         cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
 
         # 去掉开头的第一个点
         if file_path.startswith('.'):
@@ -264,6 +381,7 @@ def voicechat():
 
         # -------更新对话记录，加入reply回复，更新对话轮数-------ai方
         update_info(cursor, user_name, 'assistant', reply, 'text', None, 0, Config.MAXTURN)
+        trigger_periodic_background_tasks(cursor, user_name)
 
         # print("后端返回结果")
         response = jsonify({
@@ -362,6 +480,7 @@ def textchat():
     try:
         conn = Config.PYMYSQL_POOL.connection()
         cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
 
         # 更新用户的对话记录----用户方
         update_info(cursor, user_name, 'user', text, 'text', None, 0, Config.MAXTURN)
@@ -376,6 +495,7 @@ def textchat():
 
         # -------更新对话记录，加入reply回复-------ai方
         update_info(cursor, user_name, 'assistant', reply, 'text', None, 0, Config.MAXTURN)
+        trigger_periodic_background_tasks(cursor, user_name)
 
         # print("后端返回结果")
         response = jsonify({
@@ -824,6 +944,175 @@ def sendCode():
         })
         print(response.get_data(as_text=True))
         return response
+
+
+@app.route('/checkAllUpdateSignals', methods=['POST'])
+def check_all_update_signals():
+    if not request.is_json:
+        return jsonify({'status': 400, 'data': '请求必须为 JSON 格式'})
+
+    req_data = request.get_json()
+    user_name = req_data.get('user_name')
+    if not user_name:
+        return jsonify({'status': 400, 'data': '缺少 user_name 参数'})
+
+    conn = None
+    cursor = None
+    try:
+        conn = Config.PYMYSQL_POOL.connection()
+        cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
+        signal_data = get_all_update_signals(cursor, user_name)
+        if not signal_data:
+            return jsonify({'status': 404, 'data': '未找到该用户的信号信息'})
+
+        for key, value in list(signal_data.items()):
+            if isinstance(value, bytes):
+                signal_data[key] = value.decode('utf-8', errors='replace')
+            elif hasattr(value, 'isoformat'):
+                signal_data[key] = value.isoformat(sep=' ')
+
+        return jsonify({'status': 200, 'data': signal_data})
+    except Exception as e:
+        print(f"获取更新信号失败: {e}")
+        return jsonify({'status': 500, 'data': '服务器内部错误'})
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route('/confirmEvaluateSignal', methods=['POST'])
+def confirm_evaluate_signal():
+    if not request.is_json:
+        return jsonify({'status': 400, 'data': '请求必须为 JSON 格式'})
+
+    req_data = request.get_json()
+    user_name = req_data.get('user_name')
+    if not user_name:
+        return jsonify({'status': 400, 'data': '缺少 user_name 参数'})
+
+    conn = None
+    cursor = None
+    try:
+        conn = Config.PYMYSQL_POOL.connection()
+        cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
+        clear_evaluate_signal(cursor, user_name)
+        conn.commit()
+        return jsonify({'status': 200, 'data': 'evaluate 信号已清除'})
+    except Exception as e:
+        print(f"清除 evaluate 信号失败: {e}")
+        return jsonify({'status': 500, 'data': '服务器内部错误'})
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route('/confirmSummarySignal', methods=['POST'])
+def confirm_summary_signal():
+    if not request.is_json:
+        return jsonify({'status': 400, 'data': '请求必须为 JSON 格式'})
+
+    req_data = request.get_json()
+    user_name = req_data.get('user_name')
+    if not user_name:
+        return jsonify({'status': 400, 'data': '缺少 user_name 参数'})
+
+    conn = None
+    cursor = None
+    try:
+        conn = Config.PYMYSQL_POOL.connection()
+        cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
+        clear_summary_signal(cursor, user_name)
+        conn.commit()
+        return jsonify({'status': 200, 'data': 'summary 信号已清除'})
+    except Exception as e:
+        print(f"清除 summary 信号失败: {e}")
+        return jsonify({'status': 500, 'data': '服务器内部错误'})
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route('/getAssessmentData', methods=['POST'])
+def get_assessment_data():
+    if not request.is_json:
+        return jsonify({'status': 400, 'data': '请求必须为 JSON 格式'})
+
+    req_data = request.get_json()
+    user_name = req_data.get('user_name')
+    if not user_name:
+        return jsonify({'status': 400, 'data': '缺少 user_name 参数'})
+
+    conn = None
+    cursor = None
+    try:
+        conn = Config.PYMYSQL_POOL.connection()
+        cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
+        phq9_score, phq9_details = query_phq9_result(cursor, user_name)
+        gad7_score, gad7_details = query_gad7_result(cursor, user_name)
+        last_modified = get_last_modified_time(cursor, user_name)
+        if hasattr(last_modified, 'isoformat'):
+            last_modified = last_modified.isoformat(sep=' ')
+
+        return jsonify({
+            'status': 200,
+            'data': {
+                'phq9_score': phq9_score,
+                'phq9_level': get_phq9_level(phq9_score),
+                'phq9_detail': phq9_details,
+                'gad7_score': gad7_score,
+                'gad7_level': get_gad7_level(gad7_score),
+                'gad7_detail': gad7_details,
+                'last_modified': last_modified,
+            },
+        })
+    except Exception as e:
+        print(f"获取评估数据失败: {e}")
+        return jsonify({'status': 500, 'data': '服务器内部错误'})
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route('/getSummaryReport', methods=['POST'])
+def get_summary_report():
+    if not request.is_json:
+        return jsonify({'status': 400, 'data': '请求必须为 JSON 格式'})
+
+    req_data = request.get_json()
+    user_name = req_data.get('user_name')
+    if not user_name:
+        return jsonify({'status': 400, 'data': '缺少 user_name 参数'})
+
+    conn = None
+    cursor = None
+    try:
+        conn = Config.PYMYSQL_POOL.connection()
+        cursor = conn.cursor()
+        ensure_periodic_feature_rows(cursor, user_name)
+        summary_data = get_summary_phased(cursor, user_name)
+        if not summary_data:
+            return jsonify({'status': 404, 'data': '未找到该用户的阶段总结信息'})
+        return jsonify({'status': 200, 'data': summary_data})
+    except Exception as e:
+        print(f"获取阶段总结失败: {e}")
+        return jsonify({'status': 500, 'data': '服务器内部错误'})
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 # 设置主路由，作为程序的入口
 @app.route('/')
